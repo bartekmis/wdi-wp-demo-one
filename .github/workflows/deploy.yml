@@ -26,9 +26,9 @@ jobs:
           script: |
             set -e
             cd ${{ secrets.WP_CONTENT_PATH }}
-            git fetch origin main
-            git reset --hard origin/main
+            /usr/bin/git fetch origin main
+            /usr/bin/git reset --hard origin/main
             cd ..
-            wp cache flush || true
-            wp elementor flush-css || true
-            echo "Deployed: $(git -C wp-content rev-parse --short HEAD)"
+            /usr/local/bin/wp cache flush || true
+            /usr/local/bin/wp elementor flush-css || true
+            echo "Deployed: $(/usr/bin/git -C wp-content rev-parse --short HEAD)"
