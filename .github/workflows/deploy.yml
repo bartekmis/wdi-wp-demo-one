@@ -1,0 +1,34 @@
+name: Deploy to server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy wp-content
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script_stop: true
+          script: |
+            set -e
+            cd ${{ secrets.WP_CONTENT_PATH }}
+            git fetch origin main
+            git reset --hard origin/main
+            cd ..
+            wp cache flush || true
+            wp elementor flush-css || true
+            echo "Deployed: $(git -C wp-content rev-parse --short HEAD)"

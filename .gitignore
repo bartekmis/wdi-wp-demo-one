@@ -1,0 +1,17 @@
+uploads/
+wflogs/
+vendor/
+node_modules/
+
+# Pluginy z repozytorium WP - instalowane osobno
+plugins/
+
+# Cache i pliki tymczasowe
+cache/
+upgrade/
+
+# Pliki środowiskowe
+advanced-cache.php
+object-cache.php
+db.php
+*.log
