@@ -105,7 +105,9 @@ add_action('wp_footer', function () {
                 var modal = document.createElement('div');
                 modal.style.cssText = 'background:#fff;border-radius:12px;padding:30px;max-width:400px;width:90%;';
 
-                var inner = document.createElement('div');
+                // Build the rows off-DOM in one fragment: no layout reads in the loop
+                // (they forced a reflow per row) and no extra wrapper elements.
+                var inner = document.createDocumentFragment();
                 for (var i = 0; i < 25; i++) {
                     var row = document.createElement('div');
                     row.style.cssText = 'padding:8px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;';
@@ -114,27 +116,12 @@ add_action('wp_footer', function () {
                     label.textContent = 'Platforma ' + (i + 1);
                     row.appendChild(label);
 
-                    // forced reflow per iteration
-                    var currentHeight = modal.offsetHeight;
-                    var currentWidth = modal.offsetWidth;
-
                     var stat = document.createElement('span');
                     stat.style.fontWeight = '700';
                     stat.textContent = Math.floor(Math.random() * 1000) + ' udostepnien';
                     row.appendChild(stat);
 
-                    var wrapper1 = document.createElement('div');
-                    var wrapper2 = document.createElement('div');
-                    var wrapper3 = document.createElement('div');
-                    wrapper1.appendChild(wrapper2);
-                    wrapper2.appendChild(wrapper3);
-                    wrapper3.appendChild(row);
-                    inner.appendChild(wrapper1);
-
-                    // another forced reflow
-                    var h = inner.offsetHeight;
-                    var s = window.getComputedStyle(inner);
-                    var p = parseFloat(s.paddingTop);
+                    inner.appendChild(row);
                 }
 
                 modal.appendChild(inner);

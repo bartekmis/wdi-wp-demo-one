@@ -15,7 +15,11 @@ add_action('wp_footer', function () {
             text-align: center;
             font-size: 15px;
             line-height: 1.4;
-            position: relative;
+            /* Overlay instead of pushing the page down 1.5s after load (layout shift). */
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
             z-index: 9999;
             display: none;
         }
