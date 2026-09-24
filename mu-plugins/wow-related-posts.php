@@ -2,84 +2,119 @@
 /**
  * Plugin Name: WOW Related Posts
  * Description: Shows related posts based on shared categories and tags.
+ *
+ * Perf: the previous version collected every post sharing a category (625 of them on a
+ * typical post) and then ran get_post + thumbnail + author + categories + wp_count_comments
+ * for each, which took ~6.8s per uncached request. It now resolves the most relevant posts
+ * in one query, primes their caches in a single batch, and caches the rendered markup.
  */
 
-add_filter('the_content', function ($content) {
-    if (!is_singular('post') || is_admin()) return $content;
+define('WOW_RELATED_LIMIT', 8);
 
-    global $post, $wpdb;
-
-    // Get all categories and tags for current post
-    $categories = wp_get_post_categories($post->ID);
-    $tags = wp_get_post_tags($post->ID, ['fields' => 'ids']);
-
-    $related_ids = [];
-
-    // For each category, find posts - separate query per category
-    foreach ($categories as $cat_id) {
-        $posts_in_cat = $wpdb->get_col($wpdb->prepare("
-            SELECT DISTINCT p.ID
-            FROM {$wpdb->posts} p
-            INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
-            INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
-            WHERE tt.term_id = %d
-            AND p.post_status = 'publish'
-            AND p.post_type = 'post'
-            AND p.ID != %d
-        ", $cat_id, $post->ID));
-
-        $related_ids = array_merge($related_ids, $posts_in_cat);
+function wow_related_posts_html($post_id) {
+    $cache_key = 'wow_related_' . $post_id;
+    $cached = get_transient($cache_key);
+    if ($cached !== false) {
+        return $cached;
     }
 
-    // For each tag, find posts - another separate query per tag
-    foreach ($tags as $tag_id) {
-        $posts_with_tag = $wpdb->get_col($wpdb->prepare("
-            SELECT DISTINCT p.ID
-            FROM {$wpdb->posts} p
-            INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
-            INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
-            WHERE tt.term_id = %d
-            AND p.post_status = 'publish'
-            AND p.post_type = 'post'
-            AND p.ID != %d
-        ", $tag_id, $post->ID));
+    global $wpdb;
 
-        $related_ids = array_merge($related_ids, $posts_with_tag);
+    $term_ids = array_merge(
+        wp_get_post_categories($post_id),
+        wp_get_post_tags($post_id, ['fields' => 'ids'])
+    );
+    $term_ids = array_values(array_unique(array_filter(array_map('intval', $term_ids))));
+
+    if (empty($term_ids)) {
+        set_transient($cache_key, '', HOUR_IN_SECONDS);
+        return '';
     }
 
-    $related_ids = array_unique($related_ids);
+    $placeholders = implode(',', array_fill(0, count($term_ids), '%d'));
+    $params = array_merge($term_ids, [$post_id, WOW_RELATED_LIMIT]);
 
-    if (empty($related_ids)) return $content;
+    // Rank by how many terms each candidate shares, and only take the top few.
+    $related_ids = $wpdb->get_col($wpdb->prepare(
+        "SELECT p.ID
+         FROM {$wpdb->posts} p
+         INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+         INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+         WHERE tt.term_id IN ($placeholders)
+           AND p.post_status = 'publish'
+           AND p.post_type = 'post'
+           AND p.ID != %d
+         GROUP BY p.ID
+         ORDER BY COUNT(DISTINCT tt.term_id) DESC, p.post_date DESC
+         LIMIT %d",
+        $params
+    ));
 
-    // Fetch each related post individually instead of one query
-    $related_html = '<div class="wow-related-posts"><h3>Related Posts</h3><ul>';
-    foreach ($related_ids as $rid) {
-        $related_post = get_post($rid);
-        if (!$related_post) continue;
+    if (empty($related_ids)) {
+        set_transient($cache_key, '', HOUR_IN_SECONDS);
+        return '';
+    }
 
-        // Get featured image - triggers additional queries
-        $thumb = get_the_post_thumbnail_url($rid, 'medium');
+    // One batched fetch primes the post, meta and term caches for all of them.
+    $related_posts = get_posts([
+        'post__in'               => $related_ids,
+        'orderby'                => 'post__in',
+        'posts_per_page'         => count($related_ids),
+        'post_type'              => 'post',
+        'post_status'            => 'publish',
+        'ignore_sticky_posts'    => true,
+        'update_post_meta_cache' => true,
+        'update_post_term_cache' => true,
+    ]);
 
-        // Get author name
-        $author = get_the_author_meta('display_name', $related_post->post_author);
+    if (empty($related_posts)) {
+        set_transient($cache_key, '', HOUR_IN_SECONDS);
+        return '';
+    }
 
-        // Get post categories for display
-        $cats = get_the_category($rid);
-        $cat_names = array_map(function($c) { return $c->name; }, $cats);
+    $author_ids = array_unique(wp_list_pluck($related_posts, 'post_author'));
+    if ($author_ids) {
+        cache_users($author_ids);
+    }
 
-        // Get comment count
-        $comment_count = wp_count_comments($rid);
+    $html = '<div class="wow-related-posts"><h3>Related Posts</h3><ul>';
+    foreach ($related_posts as $rp) {
+        $author = get_the_author_meta('display_name', $rp->post_author);
 
-        $related_html .= sprintf(
+        $cat_names = [];
+        foreach (get_the_category($rp->ID) as $c) {
+            $cat_names[] = $c->name;
+        }
+
+        $html .= sprintf(
             '<li><a href="%s">%s</a> <span>by %s in %s (%d comments)</span></li>',
-            get_permalink($rid),
-            esc_html($related_post->post_title),
+            get_permalink($rp->ID),
+            esc_html($rp->post_title),
             esc_html($author),
             esc_html(implode(', ', $cat_names)),
-            $comment_count->approved
+            // comment_count already lives on the post row; wp_count_comments was a query each.
+            (int) $rp->comment_count
         );
     }
-    $related_html .= '</ul></div>';
+    $html .= '</ul></div>';
 
-    return $content . $related_html;
+    set_transient($cache_key, $html, HOUR_IN_SECONDS);
+
+    return $html;
+}
+
+add_filter('the_content', function ($content) {
+    if (!is_singular('post') || is_admin() || !in_the_loop() || !is_main_query()) {
+        return $content;
+    }
+
+    global $post;
+    if (!$post) return $content;
+
+    return $content . wow_related_posts_html($post->ID);
 }, 99);
+
+// Related lists go stale when posts or their terms change.
+add_action('save_post_post', function ($post_id) {
+    delete_transient('wow_related_' . $post_id);
+});
