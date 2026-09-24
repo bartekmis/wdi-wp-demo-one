@@ -74,6 +74,21 @@ add_action('admin_init', function () {
     if (!wow_fp_images_ready()) wow_fp_build_images();
 });
 
+/* ------------------------------------------------------- WordPress emoji */
+
+/**
+ * Every current browser renders emoji natively. The emoji loader's feature test fails
+ * on machines without a colour-emoji font (e.g. PageSpeed's Linux runners), which then
+ * pulls in wp-emoji-release.js; in traces that stalled the first frame by 1-2s.
+ */
+add_action('init', function () {
+    if (is_admin()) return;
+    remove_action('wp_head', 'print_emoji_detection_script', 7);
+    remove_action('wp_print_styles', 'print_emoji_styles');
+    remove_action('wp_enqueue_scripts', 'wp_enqueue_emoji_styles');
+    add_filter('emoji_svg_url', '__return_false');
+});
+
 /* ------------------------------------------------- resource hints + preload */
 
 add_action('wp_head', function () {
@@ -176,7 +191,7 @@ function wow_fp_after_paint_runtime() {
       for(var i=0;i<old.attributes.length;i++){var a=old.attributes[i]; if(a.name!=='type') s.setAttribute(a.name,a.value);}
       // Inline code goes through a Blob URL so it keeps its place in the ordered queue.
       if(!old.hasAttribute('src')) s.src=URL.createObjectURL(new Blob([old.text],{type:'text/javascript'}));
-      s.async=false;
+      s.async=old.hasAttribute('data-wow-async');
       old.parentNode.replaceChild(s,old);
     });
   }
@@ -224,18 +239,51 @@ add_filter('style_loader_src', function ($src) {
     return str_replace('display=block', 'display=swap', $src);
 }, 10, 1);
 
-// font-display:swap paints text with the fallback face immediately, so the webfont
-// stylesheet does not need to hold up first paint.
+/**
+ * The Google Fonts stylesheet is inlined instead of linked. As a render-blocking link it
+ * adds a cross-origin round trip before first paint; loaded "async" (preload + onload
+ * rel swap) it made Chrome hold the first frame for ~1s in PageSpeed runs. The
+ * @font-face rules themselves are tiny, so they are fetched once server-side, trimmed
+ * to the latin subsets and cached. The font files still come from fonts.gstatic.com
+ * with font-display:swap.
+ */
+function wow_fp_webfont_css($href) {
+    $href = html_entity_decode($href);
+    $key  = 'wow_webfonts_' . md5($href);
+    $css  = get_transient($key);
+    if (is_string($css)) return $css;
+
+    $response = wp_remote_get($href, [
+        'timeout'    => 3,
+        // A current Chrome UA makes Google serve woff2 with unicode-range subsets.
+        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+    ]);
+    $body = is_wp_error($response) ? '' : wp_remote_retrieve_body($response);
+    if (wp_remote_retrieve_response_code($response) !== 200 || strpos($body, '@font-face') === false) {
+        set_transient($key, '', 10 * MINUTE_IN_SECONDS); // retry later, link normally meanwhile
+        return '';
+    }
+
+    // Google prefixes every @font-face with a /* subset */ comment.
+    preg_match_all('#/\*\s*([a-z-]+)\s*\*/\s*(@font-face\s*\{[^}]*\})#i', $body, $m, PREG_SET_ORDER);
+    $css = '';
+    foreach ($m as $face) {
+        if (in_array(strtolower($face[1]), ['latin', 'latin-ext'], true)) {
+            $css .= str_replace('</', '', preg_replace('/\s+/', ' ', $face[2]));
+        }
+    }
+
+    set_transient($key, $css, WEEK_IN_SECONDS);
+    return $css;
+}
+
 add_filter('style_loader_tag', function ($tag, $handle, $href, $media) {
     if (!wow_fp_is_front() || strpos($href, 'fonts.googleapis.com') === false) return $tag;
 
-    return sprintf(
-        '<link rel="preload" as="style" id="%2$s-css" href="%1$s" onload="this.onload=null;this.rel=\'stylesheet\'">' . "\n"
-        . '<noscript><link rel="stylesheet" href="%1$s" media="%3$s"></noscript>' . "\n",
-        esc_url($href),
-        esc_attr($handle),
-        esc_attr($media ?: 'all')
-    );
+    $css = wow_fp_webfont_css($href);
+    if ($css === '') return $tag;
+
+    return '<style id="' . esc_attr($handle) . '-inline">' . $css . "</style>\n";
 }, 10, 4);
 
 /* ------------------------------------------------ delayed third-party tags */
@@ -316,10 +364,16 @@ add_action('wp_footer', function () {
     ?>
 <script id="wow-lazy-bg-js">
 (function(){
-  var els=document.querySelectorAll('.wow-lazy-bg');
-  if(!('IntersectionObserver' in window)){els.forEach(function(el){el.classList.add('wow-bg-in');});return;}
+  var els=document.querySelectorAll('.wow-lazy-bg, img[data-wow-src]');
+  function show(el){
+    if(el.tagName==='IMG'){
+      if(el.dataset.wowSrcset){el.srcset=el.dataset.wowSrcset;el.removeAttribute('data-wow-srcset');}
+      el.src=el.dataset.wowSrc; el.removeAttribute('data-wow-src');
+    } else el.classList.add('wow-bg-in');
+  }
+  if(!('IntersectionObserver' in window)){els.forEach(show);return;}
   var io=new IntersectionObserver(function(entries){
-    entries.forEach(function(en){if(en.isIntersecting){en.target.classList.add('wow-bg-in');io.unobserve(en.target);}});
+    entries.forEach(function(en){if(en.isIntersecting){show(en.target);io.unobserve(en.target);}});
   },{rootMargin:'300px 0px'});
   els.forEach(function(el){io.observe(el);});
 })();
@@ -333,11 +387,19 @@ function wow_fp_filter_html($html) {
     if (stripos($html, '</html>') === false) return $html;
 
     // 1. Third-party tags injected through WPCode's header/body boxes. The Cookiebot tag
-    //    was parser-blocking in <head> and alone held first paint ~1.7s; it stays
-    //    immediate (it is the consent tool) but no longer blocks.
+    //    was parser-blocking in <head> and alone held first paint ~1.7s. It is the
+    //    consent tool, so it is not delayed: async everywhere, and on the home page
+    //    first in the queue that starts right after first paint.
     $html = str_replace(
         '<script id="Cookiebot" src="https://consent.cookiebot.com/uc.js"',
-        '<script id="Cookiebot" async src="https://consent.cookiebot.com/uc.js"',
+        is_front_page()
+            ? '<script id="Cookiebot" type="wow/after-paint" data-wow-async src="https://consent.cookiebot.com/uc.js"'
+            : '<script id="Cookiebot" async src="https://consent.cookiebot.com/uc.js"',
+        $html
+    );
+    $html = str_replace(
+        'data-blockingmode="auto" type="text/javascript"',
+        'data-blockingmode="auto"',
         $html
     );
     $html = wow_fp_delay_third_parties($html);
@@ -397,19 +459,24 @@ function wow_fp_filter_html($html) {
 
     // 6. On the home page the hero fills the first viewport, so every <img> is below the
     //    fold (or inside the closed off-canvas menu) and should not compete with the hero
-    //    for bandwidth. The header logo is the one genuinely above-the-fold image.
+    //    for bandwidth. Native loading=lazy still fetched them before first paint (its
+    //    distance threshold is ~1250px and the off-canvas panel counts as "near"), so
+    //    they are loaded by an IntersectionObserver instead. The header logo stays eager.
     $html = preg_replace_callback(
         '#<img\s[^>]*>#i',
         function ($m) {
             $tag = $m[0];
             if (stripos($tag, 'default-logo') !== false || stripos($tag, 'logo-light') !== false) return $tag;
+            // TranslatePress clones its switcher in JS, so the observed node is replaced.
+            if (stripos($tag, '/translatepress-multilingual/assets/flags/') !== false) return $tag;
 
             $tag = preg_replace('#\s(?:loading|fetchpriority)=(["\'])[^"\']*\1#i', '', $tag);
+            $tag = preg_replace('#\s(src|srcset)=#i', ' data-wow-$1=', $tag);
             $tag = preg_replace('#<img\s#i', '<img loading="lazy" ', $tag, 1);
             if (stripos($tag, 'decoding=') === false) {
                 $tag = preg_replace('#<img\s#i', '<img decoding="async" ', $tag, 1);
             }
-            return $tag;
+            return $tag . '<noscript>' . $m[0] . '</noscript>';
         },
         $html
     );
